@@ -5,96 +5,136 @@
 
 static const char* logTAG = "NOTIFIER";
 
-reFailureNotifier::reFailureNotifier(const char* object, bool notify_alert, notify_kind_t kind, time_t* delay_sec, cb_send_notify_t cb_notify)
-{
-  _notify_alert = notify_alert;
-  _object = object;
-  _ext_object = nullptr;
-  _kind = kind;
-  _notify_delay = delay_sec;
-  _notify_cb = cb_notify;
+#define HM_LOCKED       BIT0  // Blocking notifications for an external reason
+#define HM_SENDED       BIT1  // Failure notification has been sent
 
-  _state = FNS_OK;
+reHealthMonitor::reHealthMonitor(const char* service, hm_notify_mode_t notify_mode, 
+  msg_options_t msg_options, const char* msg_ok, const char* msg_failure, 
+  uint8_t failure_thresold, hm_send_notify_t cb_notify)
+{
+  _service = service;
+  _mode = notify_mode;
+  _msg_options = msg_options;
+  _msg_ok = msg_ok;
+  _msg_failure = msg_failure;
+  _fail_thresold = failure_thresold;
+  _notify_cb = cb_notify;
+  
+  _state = ESP_OK;
+  _fail_count = 0;
+  _time_state = 0;
   _time_failure = 0;
-  _notify_send = false;
-  _timer = nullptr;
+  _notify_flags = 0;
+  
+  _object = nullptr;
+  _notify_timer = nullptr;
+  _notify_delay = nullptr;
+  _notify_enable = nullptr;
 }
 
-reFailureNotifier::~reFailureNotifier() 
+reHealthMonitor::~reHealthMonitor() 
 {
   timerStop();
-  if (_ext_object) {
-    free(_ext_object);
-    _ext_object = nullptr;
+  if (_object) {
+    free(_object);
+    _object = nullptr;
   };
 }
 
-bool reFailureNotifier::sendNotify(notify_state_t state, time_t time_state, int32_t value)
+void reHealthMonitor::assignParams(uint32_t* failure_confirm_timeout, uint8_t* enable_notify)
 {
-  rlog_i(logTAG, "Send notification for [ %s ] with state %d, value %d", _object, _state, value);
-  if (_notify_cb) {
-    if (_ext_object) {
-      return _notify_cb(this, _notify_alert, (const char*)_ext_object, state, value, _time_failure, time_state);
-    } else {
-      return _notify_cb(this, _notify_alert, _object, state, value, _time_failure, time_state);
+  _notify_delay = failure_confirm_timeout;
+  _notify_enable = enable_notify;
+}
+
+bool reHealthMonitor::sendNotifyPrivate()
+{
+  if ((_notify_enable == nullptr) || (*_notify_enable != 0)) {
+    const char* _msg_template = _state == ESP_OK ? _msg_ok : _msg_failure;
+    if (_msg_template != nullptr) {
+      const char* _msg_object = _object == nullptr ? _service : (const char*)_object;
+      if (!(_notify_flags & HM_LOCKED)) {
+        if (_notify_cb) {
+          hm_notify_data_t data = {
+            .monitor = this,
+            .object = _msg_object,
+            .msg_template = _msg_template,
+            .msg_options = _msg_options,
+            .state = _state,
+            .time_state = _time_state,
+            .time_failure = _time_failure
+          };
+          return _notify_cb(&data);
+        };
+      };
     };
   };
   return false;
 }
 
-bool reFailureNotifier::sendExNotify(notify_state_t state, time_t time_state, int32_t ext_value, char* ext_object)
+void reHealthMonitor::setStateCustom(esp_err_t new_state, time_t time_state, bool forced_send, char* ext_object)
 {
+  // Replace pointer to external object if present
   if (ext_object) {
-    if (_ext_object) free(_ext_object);
-    _ext_object = ext_object;
+    if (_object) free(_object);
+    _object = ext_object;
   };
-  if (_state != FNS_LOCKED) {
-    return sendNotify(state, time_state, ext_value);
-  };
-  return false;
-}
-
-void reFailureNotifier::setState(notify_state_t new_state, time_t time_state, char* ext_object)
-{
-  if (ext_object) {
-    if (_ext_object) free(_ext_object);
-    _ext_object = ext_object;
-  };
-  if ((_state != FNS_LOCKED) && (new_state != _state)) {
-    if (new_state == FNS_OK) {
-      _state = new_state;
-      // Stop the delayed send timer
-      timerStop();
-      // Send only if the failure time has exceeded the specified interval
-      time_t duration_failure = time_state - _time_failure;
-      if ((_time_failure > 0)
-      && ((_kind == FNK_RECOVERY) || ((_kind == FNK_AUTO) && _notify_send) || (_kind == FNK_FORCED))
-      && (!(_notify_delay) || (duration_failure >= *_notify_delay))) {
-        sendNotify(_state, time_state, 0);
-      };
-      // Reset flags
-      _time_failure = 0;
-      _notify_send = false;
-    } else {
-      // If the new status is slow and the current one is an error, then ignore until the status is good
-      if (!(new_state == FNS_SLOWDOWN && _state == FNS_FAILURE)) {
+  // Process new state
+  if (!(_notify_flags & HM_LOCKED)) {
+    // CHANGE :: FAILURE -> OK
+    if (new_state == ESP_OK) {
+      if (_state != new_state) {
         _state = new_state;
-        if (_time_failure == 0) {
-          if (time_state == 0) {
-            _time_failure = time(nullptr);
+        _time_state = time_state > 0 ? time_state : time(nullptr);
+        // Stop the delayed send timer, if exists
+        timerStop();
+        // Send only if the failure time has exceeded the specified interval
+        time_t duration_failure = _time_state - _time_failure;
+        if ((_time_failure > 0)
+          && ((_mode == HM_RECOVERY) || ((_mode == HM_AUTO) && (_notify_flags & HM_SENDED)) || (_mode == HM_FORCED))
+          && ((_notify_delay == nullptr) || (duration_failure >= *_notify_delay))) {
+            sendNotifyPrivate();
+        };
+        // Reset internal counters
+        _notify_flags &= ~HM_SENDED;
+        _time_failure = 0;
+        _fail_count = 0;
+      };
+    // CHANGE :: OK -> FAILURE
+    } else {
+      _state = new_state;
+      _time_state = time_state > 0 ? time_state : time(nullptr);
+      if (_time_failure == 0) _time_failure = _time_state;
+      if (_fail_count < UINT8_MAX) _fail_count++;
+      // If the notification has not yet been sent...
+      if ((_fail_count >= _fail_thresold) 
+        && ((_mode == HM_FAILURE) || (_mode == HM_AUTO) || (_mode == HM_FORCED))
+        && ((_notify_flags & HM_SENDED) == 0)
+        && !((_notify_timer != nullptr) && esp_timer_is_active(_notify_timer))) {
+          time_t delay_failure = _time_state - _time_failure;
+          // If the delay is not set, or more time has already passed, we send a notification immediately
+          if (forced_send || (_notify_delay == nullptr) || (delay_failure >= *_notify_delay)) {
+            if (sendNotifyPrivate()) {
+              _notify_flags |= HM_SENDED;
+            };
+          // ...otherwise start the delay timer (which can be interrupted if the status returns to ESP_OK)
           } else {
-            _time_failure = time_state;
+            timerStart();
           };
-        };
-        if ((_kind == FNK_FAILURE) || (_kind == FNK_AUTO) || (_kind == FNK_FORCED)) {
-          // Wait before notification so you don't spam short crashes
-          time_t dalay_failure = time(nullptr) - _time_failure;
-          if ((!(_notify_delay) || (dalay_failure >= *_notify_delay)) || !timerStart()) {
-            _notify_send = sendNotify(_state, time_state, 0);
-          };
-        };
       };
     };
+  };
+}
+
+void reHealthMonitor::setState(esp_err_t new_state, time_t time_state)
+{
+  setStateCustom(new_state, time_state, false, nullptr);
+}
+
+void reHealthMonitor::forcedTimeout()
+{
+  if ((_notify_timer != nullptr) && esp_timer_is_active(_notify_timer)) {
+    timerTimeout();
   };
 }
 
@@ -102,85 +142,88 @@ void reFailureNotifier::setState(notify_state_t new_state, time_t time_state, ch
 // -------------------------------------------------- Temporary blocking -------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
 
-void reFailureNotifier::lock()
+void reHealthMonitor::lock()
 {
-  if (_state != FNS_LOCKED) {
+  if (!(_notify_flags & HM_LOCKED)) {
     timerStop();
+    _notify_flags |= HM_LOCKED;
+    _notify_flags &= ~HM_SENDED;
     _time_failure = 0;
-    _notify_send = false;
-    _state = FNS_LOCKED;
+    _fail_count = 0;
+    _state = ESP_OK;
   };
 }
 
-void reFailureNotifier::unlock()
+void reHealthMonitor::unlock()
 {
-  if (_state == FNS_LOCKED) {
-    timerStop();
+  if (_notify_flags & HM_LOCKED) {
+    _notify_flags &= ~HM_LOCKED;
+    _notify_flags &= ~HM_SENDED;
     _time_failure = 0;
-    _notify_send = false;
-    _state = FNS_OK;
+    _fail_count = 0;
+    _state = ESP_OK;
   };
 }
 
-bool reFailureNotifier::locked()
+bool reHealthMonitor::isLocked()
 {
-  return (_state == FNS_LOCKED);
+  return (_notify_flags & HM_LOCKED);
 }
 
 // -----------------------------------------------------------------------------------------------------------------------
 // ------------------------------------------------ Delayed notifications ------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------
 
-static void reFailureNotifierDelayTimeout(void* arg)
+static void reHealthMonitorDelayTimeout(void* arg)
 {
   if (arg) {
-    reFailureNotifier* caller = (reFailureNotifier*)arg;
+    reHealthMonitor* caller = (reHealthMonitor*)arg;
     caller->timerTimeout();
   };
 }
 
-void reFailureNotifier::timerTimeout()
+void reHealthMonitor::timerTimeout()
 {
   timerStop();
-  if (!_notify_send && (_state != FNS_OK)) {
-    _notify_send = sendNotify(_state, _time_failure, 0);
+  if (!((_notify_flags & HM_SENDED) && (_state == ESP_OK))) {
+    if (sendNotifyPrivate()) {
+      _notify_flags |= HM_SENDED;
+    };
   };
 }
 
-bool reFailureNotifier::timerStart()
+bool reHealthMonitor::timerStart()
 {
-  if ((_notify_delay) && (*_notify_delay > 0)) {
-    if (_timer == nullptr) {
+  if ((_notify_delay != nullptr) && (*_notify_delay > 0)) {
+    if (_notify_timer == nullptr) {
       esp_timer_create_args_t timer_cfg;
       memset(&timer_cfg, 0, sizeof(esp_timer_create_args_t));
-      timer_cfg.name = _object;
-      timer_cfg.callback = reFailureNotifierDelayTimeout;
+      timer_cfg.name = "health_mon";
+      timer_cfg.callback = reHealthMonitorDelayTimeout;
       timer_cfg.arg = this;
-      RE_OK_CHECK(logTAG, esp_timer_create(&timer_cfg, &_timer), return false);
+      RE_OK_CHECK(esp_timer_create(&timer_cfg, &_notify_timer), return false);
     } else {
-      if (esp_timer_is_active(_timer)) {
-        RE_OK_CHECK(logTAG, esp_timer_stop(_timer), return false);
+      if (esp_timer_is_active(_notify_timer)) {
+        return true;
       };
     };
-    if (_timer != nullptr) {
-      rlog_d(logTAG, "Start failure notification timer for [ %s ]", _object);
-      RE_OK_CHECK(logTAG, esp_timer_start_once(_timer, *_notify_delay * 1000000), return false);
+    if (_notify_timer != nullptr) {
+      RE_OK_CHECK(esp_timer_start_once(_notify_timer, *_notify_delay * 1000000), return false);
     };
     return true;
   };
   return false;
 }
 
-bool reFailureNotifier::timerStop()
+bool reHealthMonitor::timerStop()
 {
-  if (_timer != nullptr) {
-    if (esp_timer_is_active(_timer)) {
-      RE_OK_CHECK(logTAG, esp_timer_stop(_timer), return false);
+  if (_notify_timer != nullptr) {
+    if (esp_timer_is_active(_notify_timer)) {
+      RE_OK_CHECK(esp_timer_stop(_notify_timer), return false);
     };
-    RE_OK_CHECK(logTAG, esp_timer_delete(_timer), return false);
-    _timer = nullptr;
+    RE_OK_CHECK(esp_timer_delete(_notify_timer), return false);
+    _notify_timer = nullptr;
   };
-  rlog_d(logTAG, "Deleted failure notification timer for [ %s ]", _object);
   return true;
 }
 

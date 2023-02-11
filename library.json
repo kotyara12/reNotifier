@@ -1,0 +1,16 @@
+{
+  "name": "reNotifier",
+  "version": "2.0.3",
+  "description": "Sending notifications about system and service failures to Telegram or mail",
+  "authors":
+  [
+    {
+      "name": "Alexander Razzhivin",
+      "email": "kotyara12@yandex.ru",
+      "url": "https://kotyara12.ru"
+    }
+  ],
+  "license": "MIT",
+  "frameworks": ["arduino", "espidf"],
+  "platforms": ["espressif32"]
+}

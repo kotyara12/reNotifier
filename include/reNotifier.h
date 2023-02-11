@@ -12,58 +12,79 @@
 #include <sys/types.h>
 #include <time.h>
 #include <math.h>
+#include "esp_err.h"
 #include "esp_timer.h"
 #include "project_config.h"
 #include "def_consts.h"
+#include "rTypes.h"
 #include "reEsp32.h"
 
-typedef enum {
-  FNS_OK = 0,
-  FNS_SLOWDOWN,
-  FNS_FAILURE,
-  FNS_LOCKED,
-} notify_state_t;
+class reHealthMonitor;
 
 typedef enum {
-  FNK_NONE = 0,      // No notification
-  FNK_FAILURE,       // Only in case of service failure
-  FNK_RECOVERY,      // Only when the service is restored, without considering the previous failure notification
-  FNK_AUTO,          // When restoring the service, if there was a previous failure notification
-  FNK_FORCED         // In both cases
-} notify_kind_t;
+  HM_NONE = 0,        // No notification
+  HM_FAILURE,         // Only in case of service failure
+  HM_RECOVERY,        // Only when the service is restored, without considering the previous failure notification
+  HM_AUTO,            // When restoring the service, if there was a previous failure notification
+  HM_FORCED           // In both cases
+} hm_notify_mode_t;
 
-class reFailureNotifier;
+typedef struct {
+  reHealthMonitor* monitor;
+  const char* object;
+  const char* msg_template;
+  msg_options_t msg_options;
+  esp_err_t state;
+  time_t time_state;
+  time_t time_failure;
+} hm_notify_data_t;
 
-typedef bool (*cb_send_notify_t) (reFailureNotifier* notifier, bool notify_alert, const char* object, notify_state_t state, int32_t value, time_t time_failure, time_t time_state);
+typedef bool (*hm_send_notify_t) (hm_notify_data_t *notify_data);
 
-class reFailureNotifier {
+class reHealthMonitor {
   public:
-    reFailureNotifier(const char* object, bool notify_alert, notify_kind_t kind, time_t* delay_sec, cb_send_notify_t cb_notify);
-    ~reFailureNotifier();
+    reHealthMonitor(const char* service, hm_notify_mode_t notify_mode, 
+      msg_options_t msg_options, const char* msg_ok, const char* msg_failure, 
+      uint8_t failure_thresold, hm_send_notify_t cb_notify);
+    ~reHealthMonitor();
 
-    bool sendExNotify(notify_state_t state, time_t time_state, int32_t ext_value, char* ext_object);
-    void setState(notify_state_t new_state, time_t time_state, char* ext_object);
+    // Attach external parameters
+    void assignParams(uint32_t* failure_confirm_timeout, uint8_t* enable_notify);
+
+    // Set a new state (error code) and send a notification immediately or with a delay (possibly)
+    void setStateCustom(esp_err_t new_state, time_t time_state, bool forced_send, char* ext_object);
+    void setState(esp_err_t new_state, time_t time_state);
     
+    // Early (before the timer expires) sending a notification
+    void forcedTimeout();
+
+    // Blocking notifications for an external reason
     void lock();
     void unlock();
-    bool locked();
+    bool isLocked();
 
     void timerTimeout();
   private:
-    notify_kind_t _kind = FNK_NONE;
-    notify_state_t _state = FNS_OK;
-    const char* _object = nullptr;    
-    char* _ext_object = nullptr;
+    hm_notify_mode_t _mode = HM_NONE;
+    const char* _service = nullptr;    
+    const char* _msg_ok = nullptr;
+    const char* _msg_failure = nullptr;
+    char* _object = nullptr;
+    msg_options_t _msg_options = 0;
+    esp_err_t _state = ESP_OK;
+    uint8_t _fail_thresold = 0;
+    uint8_t _fail_count = 0;
+    time_t _time_state = 0;
     time_t _time_failure = 0;
-    time_t* _notify_delay = nullptr;
-    bool _notify_alert = false;
-    bool _notify_send = false;
-    cb_send_notify_t _notify_cb = nullptr;
-    esp_timer_handle_t _timer = nullptr;
+    hm_send_notify_t _notify_cb = nullptr;
+    esp_timer_handle_t _notify_timer = nullptr;
+    uint32_t* _notify_delay = nullptr;
+    uint8_t* _notify_enable = nullptr;
+    uint8_t _notify_flags = 0;
 
-    bool sendNotify(notify_state_t state, time_t time_state, int32_t value);
     bool timerStart();
     bool timerStop();
+    bool sendNotifyPrivate();
 };
 
 #endif // __RENOTIFIER_H__
