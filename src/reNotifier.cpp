@@ -3,7 +3,9 @@
 #include "rLog.h"
 #include <string.h>
 
+#if CONFIG_RLOG_PROJECT_LEVEL > RLOG_LEVEL_NONE
 static const char* logTAG = "NOTIFIER";
+#endif // CONFIG_RLOG_PROJECT_LEVEL
 
 #define HM_LOCKED       BIT0  // Blocking notifications for an external reason
 #define HM_SENDED       BIT1  // Failure notification has been sent
